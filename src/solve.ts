@@ -1,14 +1,15 @@
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
-import os from "node:os";
-import { Readable } from "node:stream";
+import { Duplex, Readable } from "node:stream";
 import { Page, Response } from "playwright-core";
 import vosk from "vosk-lib";
 import wav from "wav";
+
+import { createFFmpeg } from "@ffmpeg/ffmpeg";
+
+import { BFRAME, CHALLENGE, MAIN_FRAME, MODEL_DIR, OUT_FILE, SOURCE_FILE } from "./constants.js";
 import { debug } from "./debug.js";
-import { MODEL_DIR, SOURCE_FILE, OUT_FILE, MAIN_FRAME, BFRAME, CHALLENGE } from "./constants.js";
 import { Mutex, sleep } from "./utils.js";
+
+const ffmpeg = createFFmpeg({ log: true });
 
 vosk.setLogLevel(-1);
 const model = new vosk.Model(MODEL_DIR);
@@ -27,7 +28,7 @@ export class NotFoundError extends Error {
  */
 export async function solve(
     page: Page,
-    { delay = 64, wait = 5000, retry = 3, ffmpeg = "ffmpeg" } = {},
+    { delay = 64, wait = 5000, retry = 3 } = {},
 ): Promise<boolean> {
     try {
         await page.waitForSelector(BFRAME, { state: "attached" });
@@ -110,7 +111,7 @@ export async function solve(
         if (res.headers()["content-type"] === "audio/mp3") {
             debug(`got audio from ${res.url()}`);
             answer = new Promise((resolve) => {
-                get_text(res, ffmpeg)
+                get_text(res)
                     .then(resolve)
                     .catch(() => undefined);
             });
@@ -165,16 +166,11 @@ export async function solve(
     return true;
 }
 
-function create_dir(): string {
-    const dir = path.resolve(os.tmpdir(), "reSOLVER-" + Math.random().toString().slice(2));
-    if (fs.existsSync(dir)) {
-        fs.rmSync(dir, { recursive: true });
+async function convertToWav(mp3data: Buffer): Promise<Uint8Array> {
+    if (!ffmpeg.isLoaded()) {
+        await ffmpeg.load();
     }
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
-}
-
-function convert(dir: string, ffmpeg = "ffmpeg"): void {
+    ffmpeg.FS("writeFile", SOURCE_FILE, new Uint8Array(mp3data));
     const args = [
         "-loglevel",
         "error",
@@ -188,13 +184,23 @@ function convert(dir: string, ffmpeg = "ffmpeg"): void {
         "16000",
         OUT_FILE,
     ];
-
-    spawnSync(ffmpeg, args, { cwd: dir, stdio: process.env.VERBOSE ? "inherit" : "ignore" });
+    await ffmpeg.run(...args);
+    const wavData = ffmpeg.FS("readFile", OUT_FILE);
+    ffmpeg.FS("unlink", SOURCE_FILE);
+    ffmpeg.FS("unlink", OUT_FILE);
+    return wavData;
 }
 
-function reconize(dir: string): Promise<string> {
+function bufferToStream(buffer: Uint8Array): Readable {
+    let stream = new Duplex();
+    stream.push(buffer);
+    stream.push(null);
+    return stream;
+}
+
+function recognize(buf: Uint8Array): Promise<string> {
     return new Promise((resolve) => {
-        const stream = fs.createReadStream(path.resolve(dir, OUT_FILE), { highWaterMark: 4096 });
+        const stream = bufferToStream(buf);
 
         const reader = new wav.Reader();
         const readable = new Readable().wrap(reader);
@@ -214,7 +220,7 @@ function reconize(dir: string): Promise<string> {
                     const result = rec
                         .result()
                         .alternatives.sort((a, b) => b.confidence - a.confidence)[0].text;
-                    stream.close(() => resolve(result));
+                    resolve(result);
                 }
             }
 
@@ -225,13 +231,9 @@ function reconize(dir: string): Promise<string> {
     });
 }
 
-async function get_text(res: Response, ffmpeg = "ffmpeg"): Promise<string> {
-    const temp_dir = create_dir();
-
-    fs.writeFileSync(path.resolve(temp_dir, SOURCE_FILE), await res.body());
-    convert(temp_dir, ffmpeg);
-    const result = await reconize(temp_dir);
-
-    fs.rmSync(temp_dir, { recursive: true });
+async function get_text(res: Response): Promise<string> {
+    const mp3data = await res.body();
+    const wavData = await convertToWav(mp3data);
+    const result = await recognize(wavData);
     return result;
 }
